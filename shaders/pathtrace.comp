@@ -1,0 +1,496 @@
+#version 430 core
+layout (local_size_x = 8, local_size_y = 8) in;
+
+// Material IDs (match CPU packing)
+const int MAT_DIAMOND = 0;
+const int MAT_GOLD    = 1;
+
+// Accumulate in XYZ
+layout (rgba32f, binding = 0) uniform image2D uAccum;
+
+// --- Geometry SSBOs ---
+struct Tri { vec4 p0; vec4 p1; vec4 p2; vec4 n0; vec4 n1; vec4 n2; };
+layout (std430, binding = 0) buffer Triangles { Tri tris[]; };
+
+struct BVHNode { vec4 bmin; vec4 bmax; ivec4 child; };
+layout (std430, binding = 1) buffer BVH { BVHNode nodes[]; };
+
+// --- Camera ---
+uniform vec3  uCamPos, uCamDir, uCamRight, uCamUp;
+uniform float uFovY, uAspect;
+
+// --- Integrator ---
+uniform uint  uFrameIndex;
+uniform int   uSamplesPerDispatch;
+uniform ivec2 uResolution;
+uniform int   uMaxDepth;
+uniform int   uRRStart;
+
+// Scene toggles
+uniform int   uShowCollet; // 1 = show gold collet triangles, 0 = hide them
+
+// Gold material controls
+uniform float uGoldRoughness; // 0.02..0.25 (polished -> brushed)
+
+// ---------------- Dome + Ring Light on black background ----------------
+// Axis points "out" of the dome (toward camera by default).
+uniform vec3  uDomeAxis;                 // normalized
+uniform vec3  uEnvBase;                  // tiny uniform fill (e.g., 0.005..0.02)
+uniform vec3  uCapRadiance;              // luminous top cap
+uniform float uCapAngle;                 // semi-angle in radians (0..pi), e.g., 55° -> 0.9599
+
+// Two rings (annular softboxes) surrounding the stone; angle measured from axis.
+uniform float uRingAngle0, uRingSigma0;  // center angle & Gaussian width (radians)
+uniform vec3  uRingRadiance0;
+uniform float uRingAngle1, uRingSigma1;
+uniform vec3  uRingRadiance1;
+
+// Small hotspot (tight lobe) to ignite sparkle/fire:
+uniform float uHotAngle, uHotSigma;      // center & width in radians
+uniform vec3  uHotRadiance;
+
+// Helper: angle from dome axis
+float angleFromAxis(vec3 rayDir, vec3 axis) {
+    float c = clamp(dot(normalize(rayDir), normalize(axis)), -1.0, 1.0);
+    return acos(c); // 0 at axis, pi at opposite
+}
+
+// Smooth circular cap (bright for theta <= capAngle, feathered at edge)
+float capMask(float theta, float capAngle) {
+    // Slightly wider feather (10%) for smoother cap roll-off
+    float feather = capAngle * 0.10;
+    float t0 = max(0.0, capAngle - feather);
+    return 1.0 - smoothstep(t0, capAngle, theta);
+}
+
+// Gaussian ring: centered at ringAngle with width sigma (radians)
+float ringProfile(float theta, float ringAngle, float sigma) {
+    float d = (theta - ringAngle) / max(sigma, 1e-5);
+    return exp(-0.5 * d*d);
+}
+
+vec3 envDomeRing(vec3 rayDir) {
+    // Make rig follow camera: drive dome axis from the current camera view dir
+    // (no CPU change needed; uCamDir is already set every frame).
+    vec3 domeAxis = normalize(uCamDir);
+
+    // Recompute polar angle using camera-locked axis
+    float theta = angleFromAxis(rayDir, domeAxis);
+
+    // Slight global scale to reduce blow-out; adjust later as you like.
+    const float kRig = 0.80;
+
+    vec3 L = uEnvBase;
+
+    // Top cap (feather is tweaked in capMask())
+    L += uCapRadiance    * capMask(theta, uCapAngle);
+
+    // Two soft rings
+    L += uRingRadiance0  * ringProfile(theta, uRingAngle0, uRingSigma0);
+    L += uRingRadiance1  * ringProfile(theta, uRingAngle1, uRingSigma1);
+
+    // Small hotspot to ignite sparkle/fire
+    L += uHotRadiance    * ringProfile(theta, uHotAngle, uHotSigma);
+
+    return L * kRig;
+}
+
+// --- Spectral (hero λ) ---
+const float WAVEL_MIN = 400.0;
+const float WAVEL_MAX = 700.0;
+const int   CMF_COUNT = 31;
+
+// (λ, x̄, ȳ, z̄), 10 nm steps
+const vec4 CIE_CMF[CMF_COUNT] = vec4[CMF_COUNT](
+    vec4(400.0, 0.014310, 0.000396, 0.067850),
+    vec4(410.0, 0.043510, 0.001210, 0.207400),
+    vec4(420.0, 0.134380, 0.004000, 0.645600),
+    vec4(430.0, 0.283900, 0.011600, 1.385600),
+    vec4(440.0, 0.348280, 0.023000, 1.747060),
+    vec4(450.0, 0.336200, 0.038000, 1.772110),
+    vec4(460.0, 0.290800, 0.060000, 1.669200),
+    vec4(470.0, 0.195360, 0.091000, 1.287640),
+    vec4(480.0, 0.095640, 0.139020, 0.813000),
+    vec4(490.0, 0.032010, 0.208020, 0.465180),
+    vec4(500.0, 0.004900, 0.323000, 0.272000),
+    vec4(510.0, 0.009300, 0.503000, 0.158200),
+    vec4(520.0, 0.063270, 0.710000, 0.078250),
+    vec4(530.0, 0.165500, 0.862000, 0.042160),
+    vec4(540.0, 0.290400, 0.954000, 0.020300),
+    vec4(550.0, 0.433450, 0.994950, 0.008750),
+    vec4(560.0, 0.594500, 0.995000, 0.003900),
+    vec4(570.0, 0.762100, 0.952000, 0.002100),
+    vec4(580.0, 0.916300, 0.870000, 0.001650),
+    vec4(590.0, 1.026300, 0.757000, 0.001100),
+    vec4(600.0, 1.062200, 0.631000, 0.000800),
+    vec4(610.0, 1.002600, 0.503000, 0.000600),
+    vec4(620.0, 0.854450, 0.381000, 0.000340),
+    vec4(630.0, 0.642400, 0.265000, 0.000240),
+    vec4(640.0, 0.447900, 0.175000, 0.000190),
+    vec4(650.0, 0.283500, 0.107000, 0.000100),
+    vec4(660.0, 0.164900, 0.061000, 0.000050),
+    vec4(670.0, 0.087400, 0.032000, 0.000030),
+    vec4(680.0, 0.046770, 0.017000, 0.000020),
+    vec4(690.0, 0.022700, 0.008210, 0.000010),
+    vec4(700.0, 0.011360, 0.004102, 0.000000)
+);
+
+vec3 cmf(float lambdaNm){
+    float l = clamp(lambdaNm, WAVEL_MIN, WAVEL_MAX);
+    float f = (l - WAVEL_MIN) / 10.0;
+    int i0 = clamp(int(floor(f)), 0, CMF_COUNT-2);
+    int i1 = i0 + 1;
+    float l0 = CIE_CMF[i0].x, l1 = CIE_CMF[i1].x;
+    float t  = (l - l0) / max(1e-6, (l1 - l0));
+    vec3 v0 = CIE_CMF[i0].yzw;
+    vec3 v1 = CIE_CMF[i1].yzw;
+    return mix(v0, v1, t);
+}
+
+vec3 whiteXYZ_E(){
+    vec3 s = vec3(0.0);
+    for (int i=0;i<CMF_COUNT;++i) s += CIE_CMF[i].yzw;
+    return s * 10.0; // 10 nm step
+}
+const vec3 D65_XYZ = vec3(0.95047, 1.0, 1.08883);
+vec3 adaptEtoD65(vec3 xyzE){
+    vec3 wE = whiteXYZ_E();
+    vec3 scale = D65_XYZ / max(wE, vec3(1e-6));
+    return xyzE * scale;
+}
+
+// RNG
+uint pcg(inout uint s){
+    s = s * 747796405u + 2891336453u;
+    uint v = ((s >> ((s >> 28) + 4)) ^ s) * 277803737u;
+    s = v;
+    return (v >> 22) ^ v;
+}
+float rnd(inout uint s){ return float(pcg(s))*(1.0/4294967296.0); }
+
+
+// ---------------- Microfacet helpers (GGX) for gold ----------------
+const float PI = 3.14159265359;
+
+float pow5(float x){ float x2=x*x; return x2*x2*x; }
+
+void makeBasis(in vec3 n, out vec3 t, out vec3 b){
+    // Frisvad 2012 orthonormal basis (stable, branch-free-ish)
+    float s = (n.z >= 0.0) ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float d = n.x * n.y * a;
+    t = vec3(1.0 + s*n.x*n.x*a, s*d, -s*n.x);
+    b = vec3(d, s + n.y*n.y*a, -n.y);
+}
+
+float D_GGX(float NoH, float alpha){
+    float a2 = alpha*alpha;
+    float d = (NoH*NoH)*(a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1e-8);
+}
+
+float G1_SmithGGX(float NoV, float alpha){
+    float a2 = alpha*alpha;
+    float b = NoV;
+    return 2.0*b / max(b + sqrt(a2 + (1.0 - a2)*b*b), 1e-8);
+}
+
+float G_SmithGGX(float NoV, float NoL, float alpha){
+    return G1_SmithGGX(NoV, alpha) * G1_SmithGGX(NoL, alpha);
+}
+
+// Heitz 2018: Sampling the GGX VNDF (isotropic)
+vec3 sampleGGXVNDF(vec3 V, float alpha, float U1, float U2){
+    // V is in local space where N=(0,0,1) and V.z>0
+    vec3 Vh = normalize(vec3(alpha*V.x, alpha*V.y, V.z));
+
+    float lensq = Vh.x*Vh.x + Vh.y*Vh.y;
+    vec3 T1 = (lensq > 0.0) ? vec3(-Vh.y, Vh.x, 0.0) * inversesqrt(lensq) : vec3(1.0, 0.0, 0.0);
+    vec3 T2 = cross(Vh, T1);
+
+    float r = sqrt(U1);
+    float phi = 2.0*PI*U2;
+    float t1 = r*cos(phi);
+    float t2 = r*sin(phi);
+
+    float s = 0.5*(1.0 + Vh.z);
+    t2 = mix(sqrt(max(0.0, 1.0 - t1*t1)), t2, s);
+
+    vec3 Nh = t1*T1 + t2*T2 + sqrt(max(0.0, 1.0 - t1*t1 - t2*t2))*Vh;
+
+    // Transform back to hemisphere configuration
+    vec3 H = normalize(vec3(alpha*Nh.x, alpha*Nh.y, max(0.0, Nh.z)));
+    return H;
+}
+
+float pdfGGXVNDF(float NoV, float NoH, float VoH, float alpha){
+    float D = D_GGX(NoH, alpha);
+    float G1V = G1_SmithGGX(NoV, alpha);
+    float pdfH = D * G1V * NoH / max(NoV, 1e-8);
+    return pdfH / max(4.0*VoH, 1e-8);
+}
+
+// Rays & intersections (unchanged)
+struct Ray{ vec3 o; vec3 d; };
+vec3 safeRcp(vec3 d){ vec3 a=abs(d); vec3 r=1.0/max(a,vec3(1e-8)); return vec3(sign(d.x)*r.x,sign(d.y)*r.y,sign(d.z)*r.z); }
+bool hitAABB(vec3 ro, vec3 rcp, vec3 bmin, vec3 bmax, out float tmin){
+    vec3 t0=(bmin-ro)*rcp, t1=(bmax-ro)*rcp;
+    vec3 tsm=min(t0,t1), tbg=max(t0,t1);
+    float tN=max(max(tsm.x,tsm.y),tsm.z);
+    float tF=min(min(tbg.x,tbg.y),tbg.z);
+    tmin=tN; return tF>=max(tN,0.0);
+}
+bool hitTri(Ray r, Tri tIn, out float t, out vec3 nGeom, out vec3 nShade){
+    vec3 a = tIn.p0.xyz;
+    vec3 b = tIn.p1.xyz;
+    vec3 c = tIn.p2.xyz;
+
+    // Möller–Trumbore intersection (returns barycentrics u,v)
+    vec3 ab=b-a, ac=c-a, p=cross(r.d,ac);
+    float det=dot(ab,p); if (abs(det)<1e-8) return false;
+    float invDet=1.0/det;
+    vec3 tv=r.o-a; float u=dot(tv,p)*invDet; if (u<0.0 || u>1.0) return false;
+    vec3 q=cross(tv,ab); float v=dot(r.d,q)*invDet; if (v<0.0 || u+v>1.0) return false;
+    t=dot(ac,q)*invDet; if (t<0.0005) return false;
+
+    nGeom = normalize(cross(ab,ac));
+
+    // Smooth shading normal from vertex normals (gold); diamond will use nGeom.
+    vec3 ns = normalize((1.0-u-v)*tIn.n0.xyz + u*tIn.n1.xyz + v*tIn.n2.xyz);
+
+    // Keep shading normal consistent with geometric normal orientation
+    if (dot(ns, nGeom) < 0.0) ns = -ns;
+    nShade = ns;
+    return true;
+}
+bool intersectScene(Ray r, out float tHit, out vec3 nGeomHit, out vec3 nShadeHit, out int matHit){
+    int stack[64]; int sp=0; stack[sp++]=0; vec3 rcp=safeRcp(r.d);
+    tHit=1e30; bool hit=false; int bestMat = MAT_DIAMOND;
+    vec3 bestNg = vec3(0,1,0);
+    vec3 bestNs = vec3(0,1,0);
+
+    while(sp>0){
+        int idx=stack[--sp];
+        BVHNode node=nodes[idx];
+        float tminBox;
+        if(!hitAABB(r.o,rcp,node.bmin.xyz,node.bmax.xyz,tminBox) || tminBox>tHit) continue;
+        int left=node.child.x, right=node.child.y, start=node.child.z, count=node.child.w;
+        if(count>0){
+            for(int i=0;i<count;++i){
+                Tri t=tris[start+i];
+                int mat = int(t.p0.w + 0.5);
+                if (mat == MAT_GOLD && uShowCollet == 0) continue;
+
+                float th; vec3 ng; vec3 ns;
+                if(hitTri(r, t, th, ng, ns)){
+                    if(th<tHit){
+                        tHit=th;
+                        bestNg=ng;
+                        bestNs=ns;
+                        bestMat=mat;
+                        hit=true;
+                    }
+                }
+            }
+        }else{
+            if(left>=0) stack[sp++]=left;
+            if(right>=0) stack[sp++]=right;
+        }
+    }
+
+    matHit = bestMat;
+    nGeomHit = bestNg;
+    nShadeHit = bestNs;
+    return hit;
+}
+
+Ray makePrimaryRay(ivec2 pix, ivec2 res, inout uint rng){
+    vec2 j=vec2(rnd(rng),rnd(rng));
+    vec2 uv=(vec2(pix)+j)/vec2(res);
+    vec2 ndc=uv*2.0-1.0; ndc.x*=uAspect;
+    float tH=tan(0.5*uFovY);
+    vec3 d=normalize(uCamDir + ndc.x*tH*uCamRight + ndc.y*tH*uCamUp);
+    return Ray(uCamPos,d);
+}
+
+
+
+
+// Simple wavelength-dependent reflectance for polished gold (phase-1 approximation).
+// This is *not* a full conductor Fresnel model; it’s intended as a fast, stable first step.
+float goldReflectanceApprox(float lambdaNm) {
+    // Approx curve: lower in blue, high in red.
+    float t = clamp((lambdaNm - 400.0) / 300.0, 0.0, 1.0);
+    return mix(0.35, 0.95, smoothstep(0.0, 1.0, t));
+}
+
+// Dielectric
+float fresnelDielectric(float cosI, float etaI, float etaT, float cosT){
+    float Rs=(etaI*cosI - etaT*cosT)/(etaI*cosI + etaT*cosT);
+    float Rp=(etaI*cosT - etaT*cosI)/(etaI*cosT + etaT*cosI);
+    return 0.5*(Rs*Rs + Rp*Rp);
+}
+bool refractDir(vec3 wi, vec3 n, float eta, out vec3 wt, out float cosI){
+    cosI=clamp(dot(-wi,n),-1.0,1.0);
+    float sin2=max(0.0,1.0-cosI*cosI);
+    float k=1.0-eta*eta*sin2;
+    if(k<0.0) return false;
+    wt=normalize(eta*wi + (eta*cosI - sqrt(k))*n);
+    return true;
+}
+
+// --- Sellmeier n(λ) for diamond (λ in micrometers) ---
+// Source (two-term): n^2 = 1 + (4.3356 λ^2)/(λ^2 - 0.1060^2) + (0.3306 λ^2)/(λ^2 - 0.1750^2)
+// See JHU/APL "Optical Properties of Diamond" (Thomas & Tropf) for the visible/near-IR fit.
+float iorDiamondSellmeier(float lambdaNm) {
+    float lam = lambdaNm * 1e-3; // nm -> µm
+    float lam2 = lam*lam;
+    float n2 = 1.0
+             + 4.3356 * lam2 / (lam2 - 0.1060*0.1060)
+             + 0.3306 * lam2 / (lam2 - 0.1750*0.1750);
+    return sqrt(max(n2, 1.0));
+}
+
+vec3 offsetPoint(vec3 p, vec3 n, float eps){ return p + n*eps; }
+
+void main(){
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    if(gid.x>=uResolution.x || gid.y>=uResolution.y) return;
+
+    uint rng = uint(gid.x + gid.y*uResolution.x) ^ (uFrameIndex*9781u);
+    vec3 xyzAccum = vec3(0.0);
+
+    for(int s=0; s<uSamplesPerDispatch; ++s){
+        float u = rnd(rng);
+        float lambda = mix(WAVEL_MIN, WAVEL_MAX, u);
+        vec3 cmfBar  = cmf(lambda);
+        const float invPdf = (WAVEL_MAX - WAVEL_MIN);
+
+        Ray ray = makePrimaryRay(gid, uResolution, rng);
+        vec3 throughput = vec3(1.0);
+
+        for(int depth=0; depth<uMaxDepth; ++depth){
+            float tHit; vec3 nGeomHit; vec3 nShadeHit; int matHit;
+            if(!intersectScene(ray, tHit, nGeomHit, nShadeHit, matHit)){
+                if (depth == 0) {
+                    // Primary-ray miss -> pure black outside the stone
+                    // (Accumulate nothing; analysis-friendly silhouette)
+                    // xyzAccum += vec3(0); // implicit
+                } else {
+                    // Secondary miss -> environment lighting remains active
+                    vec3 envRGB = envDomeRing(ray.d);
+
+                    // Treat env as equal-energy spectrum -> integrate against CMF
+                    float E = (envRGB.r + envRGB.g + envRGB.b) * (1.0/3.0);
+                    vec3 xyzE = cmfBar * (E * (WAVEL_MAX - WAVEL_MIN));
+                    vec3 xyzD65 = adaptEtoD65(xyzE);
+                    xyzAccum += throughput * xyzD65;
+                }
+                break;
+            }
+
+            vec3 hp = ray.o + tHit*ray.d;
+
+            // Geometric normal (robust for inside/outside + ray offsets)
+            vec3 ng = normalize(nGeomHit);
+            bool inside = dot(ray.d, ng) > 0.0;
+            if(inside) ng = -ng;
+
+            // Gold collet: microfacet GGX reflection (much more realistic than perfect mirror)
+            if (matHit == MAT_GOLD) {
+                // Shading normal from vertex normals
+                vec3 n = normalize(nShadeHit);
+                if (dot(n, ng) < 0.0) n = -n;
+                if (dot(n, -ray.d) < 0.0) n = -n;
+
+                float rough = clamp(uGoldRoughness, 0.02, 0.35);
+                float alpha = rough * rough;
+
+                vec3 V = normalize(-ray.d); // points away from surface
+
+                // Build tangent frame for local sampling
+                vec3 T, B;
+                makeBasis(n, T, B);
+                vec3 Vlocal = normalize(vec3(dot(V, T), dot(V, B), dot(V, n)));
+
+                // Sample GGX visible normals
+                vec3 Hlocal = sampleGGXVNDF(Vlocal, alpha, rnd(rng), rnd(rng));
+                vec3 H = normalize(T*Hlocal.x + B*Hlocal.y + n*Hlocal.z);
+
+                vec3 L = normalize(reflect(ray.d, H));
+                float NoL = dot(n, L);
+                float NoV = max(dot(n, V), 0.0);
+                float NoH = max(dot(n, H), 0.0);
+                float VoH = max(dot(V, H), 0.0);
+
+                // If the sampled direction goes below the surface, stop
+                if (NoL <= 0.0 || NoV <= 0.0) break;
+
+                // Fresnel (Schlick) using wavelength-dependent F0 approximation
+                float F0 = clamp(goldReflectanceApprox(lambda), 0.0, 1.0);
+                float F  = F0 + (1.0 - F0) * pow5(1.0 - VoH);
+
+                float D = D_GGX(NoH, alpha);
+                float G = G_SmithGGX(NoV, NoL, alpha);
+
+                float pdf = pdfGGXVNDF(NoV, NoH, VoH, alpha);
+
+                // Microfacet BRDF weight: throughput *= f * cos / pdf
+                float f = (D * G * F) / max(4.0 * NoV * NoL, 1e-8);
+                float w = f * NoL / max(pdf, 1e-8);
+                throughput *= vec3(w);
+
+                if(depth>=uRRStart){
+                    float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.99);
+                    if(rnd(rng) > p) break;
+                    throughput /= p;
+                }
+
+                // Offset along geometric normal to avoid self-intersections with shading normals
+                ray.o = offsetPoint(hp, ng, 1e-4);
+                ray.d = L;
+                continue;
+            }
+
+            // Diamond uses geometric normal (facets stay crisp)
+            vec3 n  = ng;
+
+            float nExt=1.0, nInt=iorDiamondSellmeier(lambda);
+            float etaI = inside ? nInt : nExt;
+            float etaT = inside ? nExt : nInt;
+            float eta  = etaI / etaT;
+
+            vec3 wt; float cosI;
+            bool canRefract = refractDir(ray.d, n, eta, wt, cosI);
+            float R;
+            if(!canRefract){
+                R = 1.0;
+            }else{
+                float sin2I = max(0.0, 1.0 - cosI*cosI);
+                float sin2T = eta*eta * sin2I;
+                float cosT  = sqrt(max(0.0, 1.0 - sin2T));
+                R = clamp(fresnelDielectric(cosI, etaI, etaT, cosT), 0.0, 1.0);
+            }
+
+            if(depth>=uRRStart){
+                float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.99);
+                if(rnd(rng) > p) break;
+                throughput /= p;
+            }
+
+            if(rnd(rng) < R || !canRefract){
+                ray.o = offsetPoint(hp, n, 1e-4);
+                ray.d = reflect(ray.d, n);
+            }else{
+                ray.o = offsetPoint(hp, -n, 1e-4);
+                ray.d = wt;
+            }
+        }
+    }
+
+    vec4 prev = imageLoad(uAccum, gid);
+    float a = 1.0 / float(uFrameIndex + 1u);
+    vec3 outXYZ = mix(prev.rgb, xyzAccum / float(max(1, uSamplesPerDispatch)), a);
+    outXYZ = max(outXYZ, vec3(0.0)); // <- guard tiny negatives
+    imageStore(uAccum, gid, vec4(outXYZ, 1.0));
+}
